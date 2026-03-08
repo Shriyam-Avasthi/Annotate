@@ -7,15 +7,17 @@ import numpy as np
 import json
 import torch
 from scout import Scout
+import gc
 
-TARGET_IMAGE = "assets/test-2.jpg"
+TARGET_IMAGE = "assets/test-4.jpg"
 ANCHOR_DIR = "assets/anchors/Extra/"
 TEXT_PROMPT = "A pothole."
+FINETUNE_PATH = "verifier/dino_finetune.pt"
 
-MODEL_PKG_PATH = "verifier/pothole_verifier_v15.pkl"
+MODEL_PKG_PATH = "verifier/pothole_verifier_v17.pkl"
 # This is the new file where we will save the boxes/paths
-DATASET_PATH = "verifier/pothole_training_data_2.json"
-# DATASET_PATH = None
+# DATASET_PATH = "verifier/pothole_training_data_2.json"
+DATASET_PATH = None
 
 def save_dataset(verified_data, output_path):
     """Saves the verification data (paths and tensors) to a JSON file."""
@@ -66,6 +68,7 @@ def main():
     engine = AnnotateEngine()
     # scout = Scout(engine)
     # debugger = VisualDebugger()
+    engine.load_finetuned_dino(FINETUNE_PATH)
 
     verifier_pkg = engine.load_verifier(MODEL_PKG_PATH)
     saved_dataset = load_dataset(DATASET_PATH)
@@ -74,7 +77,8 @@ def main():
 
     if saved_dataset is not None:
         print(f"--> [Setup] Found saved dataset ({len(saved_dataset)} images). Skipping manual calibration.")
-        
+        engine.fine_tune_dino(saved_dataset, save_path=FINETUNE_PATH, n_epochs=80)
+
         engine.calibrate_size_thresholds(saved_dataset)
 
         # n_trials = 50
@@ -92,6 +96,7 @@ def main():
         }
 
     elif verifier_pkg is None:
+        engine.load_finetuned_dino(FINETUNE_PATH)
         print("--> [Calibrate] No saved model or dataset found. Starting calibration...")
         anchor_files = glob.glob(os.path.join(ANCHOR_DIR, "*.*"))
         
@@ -120,11 +125,14 @@ def main():
             return
 
     else:
+        engine.load_finetuned_dino(FINETUNE_PATH)
         print("--> [Setup] Loaded cached model directly (No retraining).")
 
     if verifier_pkg is None:
         print("[Error] Failed to load or train a verifier.")
         return
+   
+    engine.load_finetuned_dino(FINETUNE_PATH)
 
     verifier_model = verifier_pkg['model']
     X_train = verifier_pkg['X']
@@ -153,6 +161,10 @@ def main():
                 file_name="rejected_by_svm.jpg", use_padding=True, show_boxes=True
             )
             
+        del rej_boxes_xyxy, rej_masks, reject_boxes, reject_scores
+        gc.collect()
+        torch.cuda.empty_cache()
+
         boxes_xyxy, masks = engine.generate_masks(
             image_source, filtered_boxes, logits=svm_scores, debug=False
         )

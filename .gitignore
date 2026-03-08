@@ -1,3 +1,7 @@
+# Ignore the specific folder and all its contents
+./weights
+./verifier
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

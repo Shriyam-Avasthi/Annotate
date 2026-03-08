@@ -114,13 +114,13 @@ class EnsembleVerifier:
         # Pipeline with adaptive SVD
         n_samples, n_features = X.shape
         max_safe_dim = n_samples // 5
-        target_dim = min(512, n_features - 1, max_safe_dim)
+        target_dim = min(256, n_features - 1, max_safe_dim)
         
         steps = []
         if n_features > target_dim and target_dim > 10:
             print(f"    [Dimensionality] SVD: {n_features} -> {target_dim}")
-            # steps.append(('svd', TruncatedSVD(n_components=target_dim, random_state=42)))
-            # steps.append(('scaler', StandardScaler()))
+            steps.append(('svd', TruncatedSVD(n_components=target_dim, random_state=42)))
+            steps.append(('scaler', StandardScaler()))
         
         steps.append(('ensemble', ensemble))
         

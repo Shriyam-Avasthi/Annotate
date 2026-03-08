@@ -10,7 +10,9 @@ import os
 import joblib
 from utils import ImageProcessor
 from verifier import EnsembleVerifier
-
+from tqdm import tqdm
+import torch.optim as optim
+from torch.cuda.amp import GradScaler
 # Grounding DINO Imports
 import groundingdino.datasets.transforms as T
 from groundingdino.util.inference import load_model, predict
@@ -186,6 +188,7 @@ class AnnotateEngine:
             'large': 2.5,
             'very_large': 2.0
         }
+        self._dino_cache = {}   # caches patch tokens per image to avoid redundant forward passes
 
         print("[Init] Ready.")
 
@@ -417,6 +420,222 @@ class AnnotateEngine:
         torch.cuda.empty_cache()
         print(f"    [Cache] Done. Cached {len(cache)} samples.")
         return cache
+
+    def fine_tune_dino(self, verified_data, save_path="verifier/dino_finetune.pt",n_epochs=80, batch_size=16, grad_accum_steps=2):
+        print("\n--> [FineTune] Preparing data...")
+
+        # --- 1. Collect crops (no augmentation yet) ---
+        all_crops  = []
+        all_labels = []
+        augmentor  = Augmentor()
+
+        for item in verified_data:
+            if len(item['pos']) == 0 and len(item['neg']) == 0:
+                continue
+            image_source, _ = ImageProcessor.load_image(item['path'], self.STANDARD_IMAGE_SCALE)
+            pos_crops, _ = self._get_dual_crops(image_source, item['pos'])
+            neg_crops, _ = self._get_dual_crops(image_source, item['neg'])
+            all_crops.extend(pos_crops);  all_labels.extend([1] * len(pos_crops))
+            all_crops.extend(neg_crops);  all_labels.extend([0] * len(neg_crops))
+
+        # Cap to avoid explosion: max 300 pos, 600 neg (augmented below)
+        pos_idx = [i for i,l in enumerate(all_labels) if l == 1][:300]
+        neg_idx = [i for i,l in enumerate(all_labels) if l == 0][:600]
+        keep    = pos_idx + neg_idx
+        all_crops  = [all_crops[i]  for i in keep]
+        all_labels = [all_labels[i] for i in keep]
+
+        ft_transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        base_tensors = torch.stack([ft_transform(c) for c in all_crops])
+        base_labels  = torch.tensor(all_labels, dtype=torch.long)
+
+        # Light augmentation at tensor level only (no extra forward passes)
+        aug_tf = transforms.Compose([
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2),
+        ])
+        aug_tensors = torch.stack([aug_tf(ft_transform(c)) for c in all_crops * 2])
+        aug_labels  = base_labels.repeat(2)
+
+        tensors = torch.cat([base_tensors, aug_tensors])
+        labels  = torch.cat([base_labels,  aug_labels])
+
+        n_pos = (labels == 1).sum().item()
+        n_neg = (labels == 0).sum().item()
+        print(f"    [FineTune] {n_pos} pos | {n_neg} neg | {len(tensors)} total samples")
+
+        # --- 2. Model setup: freeze ALL except last 1 block ---
+        dino_model = self.model_manager.models['dino']
+        dino_model.to(self.device)
+        self.model_manager.current_key = 'dino'
+
+        for param in dino_model.parameters():
+            param.requires_grad = False
+
+        # Only last 1 block trainable — reduces params from 25M → 12M
+        # and more importantly, the cached activation boundary is much later
+        last_block_idx = len(dino_model.blocks) - 1
+        for param in dino_model.blocks[last_block_idx].parameters():
+            param.requires_grad = True
+
+        proj_head = torch.nn.Sequential(
+            torch.nn.Linear(1024, 128),
+            torch.nn.ReLU(),
+            torch.nn.Linear(128, 64),
+        ).to(self.device)
+
+        # --- 3. PRE-COMPUTE frozen activations (the key speedup) ---
+        # Run everything up to block[-2], cache output.
+        # Training loop only runs block[-1] + proj_head.
+        print("    [FineTune] Pre-computing frozen activations (one-time)...")
+
+        frozen_cache = []
+        dino_model.eval()
+
+        # We need activations at the input to the last block.
+        # Use a hook on the last block's INPUT.
+        captured = {}
+        def capture_input(module, inp, out):
+            # inp is a tuple; inp[0] is (B, N+1, 1024)
+            captured['x'] = inp[0].detach()
+
+        hook = dino_model.blocks[last_block_idx].register_forward_hook(capture_input)
+
+        CACHE_BATCH = 32
+        with torch.no_grad():
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                for i in range(0, len(tensors), CACHE_BATCH):
+                    batch = tensors[i:i+CACHE_BATCH].to(self.device)
+                    dino_model(batch)   # full forward; hook captures pre-last-block activations
+                    # captured['x'] is (B, 197, 1024) — sequence of patch tokens
+                    frozen_cache.append(captured['x'].float().cpu())
+                    del batch
+
+        hook.remove()
+        del captured
+        torch.cuda.empty_cache()
+
+        frozen_acts = torch.cat(frozen_cache, dim=0)   # (N, 197, 1024) on CPU
+        del frozen_cache
+        print(f"    [FineTune] Cached {frozen_acts.shape[0]} activations. "
+              f"Shape: {tuple(frozen_acts.shape)}")
+
+        # --- 4. Training loop (only runs last block + proj_head) ---
+        trainable_params = (
+            list(dino_model.blocks[last_block_idx].parameters()) +
+            list(proj_head.parameters())
+        )
+        n_trainable = sum(p.numel() for p in trainable_params)
+        print(f"    [FineTune] Trainable: {n_trainable/1e6:.1f}M params")
+        print(f"--> [FineTune] Training {n_epochs} epochs...")
+
+        optimizer = optim.AdamW(trainable_params, lr=2e-5, weight_decay=0.01)
+        scaler    = GradScaler()
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
+
+        last_block = dino_model.blocks[last_block_idx]
+
+        def supcon_loss(features, labels, temperature=0.07):
+            device = features.device
+            n = features.shape[0]
+            sim = torch.matmul(features, features.T) / temperature
+            self_mask = torch.eye(n, dtype=torch.bool, device=device)
+            sim.masked_fill_(self_mask, float('-inf'))
+            pos_mask = (labels.unsqueeze(0) == labels.unsqueeze(1)) & ~self_mask
+            if pos_mask.sum() == 0:
+                return torch.tensor(0.0, requires_grad=True, device=device)
+            log_prob = sim - torch.logsumexp(sim, dim=1, keepdim=True)
+            loss = -(log_prob.masked_fill(~pos_mask, 0.0)).sum(dim=1) / pos_mask.sum(dim=1).clamp(min=1)
+            return loss.mean()
+
+        best_loss = float('inf')
+
+        for epoch in tqdm(range(n_epochs)):
+            last_block.train()
+            proj_head.train()
+
+            perm         = torch.randperm(len(frozen_acts))
+            epoch_acts   = frozen_acts[perm]
+            epoch_labels = labels[perm]
+
+            epoch_loss = 0.0
+            n_batches  = 0
+            optimizer.zero_grad()
+
+            for i in range(0, len(epoch_acts), batch_size):
+                # Load pre-computed frozen activations — no encoder forward pass
+                batch_acts   = epoch_acts[i:i+batch_size].to(self.device)
+                batch_labels = epoch_labels[i:i+batch_size].to(self.device)
+
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    # Only run the last block + proj head
+                    out   = last_block(batch_acts)     # (B, 197, 1024)
+                    cls   = out[:, 0, :]               # CLS token (B, 1024)
+                    proj  = proj_head(cls)             # (B, 64)
+                    proj  = F.normalize(proj, dim=1)
+                    loss  = supcon_loss(proj, batch_labels) / grad_accum_steps
+
+                scaler.scale(loss).backward()
+
+                if (i // batch_size + 1) % grad_accum_steps == 0 or \
+                   (i + batch_size) >= len(epoch_acts):
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+
+                epoch_loss += loss.item() * grad_accum_steps
+                n_batches  += 1
+                del batch_acts, batch_labels, out, cls, proj, loss
+
+            scheduler.step()
+            avg_loss = epoch_loss / max(n_batches, 1)
+
+            if (epoch + 1) % 10 == 0:
+                print(f"    Epoch {epoch+1:3d}/{n_epochs} | "
+                      f"Loss: {avg_loss:.4f} | "
+                      f"LR: {scheduler.get_last_lr()[0]:.2e}")
+
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                torch.save({
+                    'block_state': dino_model.blocks[last_block_idx].state_dict(),
+                    'block_idx':   last_block_idx,
+                    'proj_head':   proj_head.state_dict(),
+                    'epoch':       epoch,
+                    'loss':        best_loss,
+                }, save_path)
+
+        print(f"\n--> [FineTune] Done. Best loss: {best_loss:.4f} | Saved: {save_path}")
+
+        for param in dino_model.parameters():
+            param.requires_grad = False
+
+        del frozen_acts
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        return proj_head
+
+    def load_finetuned_dino(self, save_path="verifier/dino_finetune.pt"):
+        if not os.path.exists(save_path):
+            print(f"--> [FineTune] No fine-tuned weights found at {save_path}")
+            return False
+
+        print(f"--> [FineTune] Loading fine-tuned DINOv2 weights from {save_path}...")
+        checkpoint  = torch.load(save_path, map_location='cpu')
+        dino_model  = self.model_manager.models['dino']
+        block_idx   = checkpoint['block_idx']
+
+        dino_model.blocks[block_idx].load_state_dict(checkpoint['block_state'])
+        print(f"    [FineTune] Restored block {block_idx} | "
+              f"epoch {checkpoint['epoch']} | loss {checkpoint['loss']:.4f}")
+        return True
 
     def tune_context_factors_optuna(self, verified_data, n_trials=50):
         """
@@ -681,6 +900,142 @@ class AnnotateEngine:
         visual_feats = F.normalize(visual_feats, dim=1, p=2)
 
         return visual_feats
+    def extract_roi_patch_features(self, image_source, boxes, force_cpu=False):
+        """
+        Runs ONE DINOv2 forward pass on the full image, then does ROI pooling per box.
+        Produces object, context, and contrast features with no context scale parameter.
+        
+        Multi-layer:
+          - blocks[5]  → early (texture, low-level patterns)
+          - blocks[11] → mid   (structural)
+          - final      → late  (semantic)
+        
+        Per-box output:
+          obj_early  (1024) — what the object looks like texturally
+          obj_late   (1024) — what the object is semantically
+          ctx_late   (1024) — what surrounds it
+          contrast   (1024) — obj_late - ctx_late  (the key discriminator)
+          mid_global (1024) — full-scene structural context
+        
+        Total: (N, 5120). No crop, no scale factor, no magic number.
+        Cached: repeated calls with the same image_source hit the cache.
+        """
+        if len(boxes) == 0:
+            return torch.empty(0)
+
+        boxes_np = boxes.cpu().numpy() if isinstance(boxes, torch.Tensor) else np.array(boxes)
+
+        # --- Device setup (mirrors existing extract_dino_features pattern) ---
+        if force_cpu:
+            dino_model = self.model_manager.models['dino']
+            dino_model.to(self.cpu)
+            self.model_manager.invalidate('dino')
+            device = self.cpu
+        else:
+            self.model_manager.switch_to('dino')
+            dino_model = self.model_manager.models['dino']
+            device = self.device
+
+        # --- Single forward pass, cached by image identity ---
+        img_id = hash(image_source.tobytes())
+        cache_valid = (
+            self._dino_cache.get('img_id') == img_id and
+            self._dino_cache.get('device') == device
+        )
+
+        if not cache_valid:
+            pil_img = Image.fromarray(image_source)
+            img_tensor = self.dino_transform(pil_img).unsqueeze(0).to(device)
+            # dino_transform resizes to (336, 336) → patch grid is 336/14 = 24x24
+
+            intermediate = {}
+
+            def make_hook(key):
+                def hook(module, inp, out):
+                    # out: (B, num_patches+1, dim) — index 0 is CLS, rest are patches
+                    intermediate[key] = out[:, 1:, :].detach()
+                return hook
+
+            h_early = dino_model.blocks[5].register_forward_hook(make_hook('early'))
+            h_mid   = dino_model.blocks[11].register_forward_hook(make_hook('mid'))
+
+            try:
+                with torch.no_grad():
+                    if device == self.device:
+                        with torch.autocast(device_type=self.device, dtype=torch.float16):
+                            out = dino_model.forward_features(img_tensor)
+                    else:
+                        out = dino_model.forward_features(img_tensor)
+            finally:
+                h_early.remove()
+                h_mid.remove()
+            GRID = 336 // 14   # = 24
+            DIM  = 1024        # ViT-L hidden dim
+
+            # Move everything to CPU immediately to free VRAM
+            self._dino_cache = {
+                'img_id': img_id,
+                'device': device,
+                'early': intermediate['early'].float().cpu()[0].reshape(GRID, GRID, DIM),  # (24,24,1024)
+                'mid':   intermediate['mid'].float().cpu()[0].reshape(GRID, GRID, DIM),
+                'late':  out['x_norm_patchtokens'].float().cpu()[0].reshape(GRID, GRID, DIM),
+                'grid':  GRID,
+                'dim':   DIM,
+            }
+
+            del img_tensor, intermediate, out
+
+        grid = self._dino_cache['grid']
+        dim  = self._dino_cache['dim']
+        feat_early = self._dino_cache['early']   # (24, 24, 1024) on CPU
+        feat_mid   = self._dino_cache['mid']
+        feat_late  = self._dino_cache['late']
+
+        # Precompute mid global once (same for all boxes in this image)
+        mid_global = F.normalize(feat_mid.reshape(-1, dim).mean(0, keepdim=True), dim=1).squeeze(0)
+
+        # --- Per-box ROI pooling ---
+        all_features = []
+
+        for box in boxes_np:
+            cx, cy, bw, bh = box
+
+            # Map normalized cxcywh → patch grid integer bounds
+            x1 = max(0,    int((cx - bw / 2) * grid))
+            y1 = max(0,    int((cy - bh / 2) * grid))
+            x2 = min(grid, int((cx + bw / 2) * grid) + 1)
+            y2 = min(grid, int((cy + bh / 2) * grid) + 1)
+
+            # Guarantee at least one patch
+            x2 = max(x2, x1 + 1)
+            y2 = max(y2, y1 + 1)
+
+            # Inner ROI (object patches)
+            obj_early = feat_early[y1:y2, x1:x2].reshape(-1, dim).mean(0)
+            obj_late  = feat_late[y1:y2, x1:x2].reshape(-1, dim).mean(0)
+
+            # Outer ROI (all patches outside the box = true context, no scale param)
+            inner_mask             = torch.zeros(grid, grid, dtype=torch.bool)
+            inner_mask[y1:y2, x1:x2] = True
+            ctx_late = feat_late[~inner_mask].mean(0)
+
+            # Contrast: what makes this box different from its surroundings
+            contrast = obj_late - ctx_late
+
+            # Normalize each component independently before concatenating
+            def n(t): return F.normalize(t.unsqueeze(0), dim=1, p=2).squeeze(0)
+
+            feat = torch.cat([
+                n(obj_early),   # (1024) — texture signal
+                n(obj_late),    # (1024) — semantic object identity
+                n(ctx_late),    # (1024) — semantic surroundings
+                n(contrast),    # (1024) — object vs background gap
+                mid_global,     # (1024) — already normalized above
+            ])   # → (5120,)
+
+            all_features.append(feat)
+
+        return torch.stack(all_features).float()   # (N, 5120)
 
     def _extract_geometric_features(self, boxes, img_shape):
         """
@@ -766,21 +1121,20 @@ class AnnotateEngine:
             obj_crops: List of PIL Image crops (object-focused)
             ctx_crops: List of PIL Image crops (context-focused)
             force_cpu: Whether to force CPU for feature extraction
+
+        !! NOTE:
+            Visual features now come from ROI patch pooling (single DINOv2 pass).
+            obj_crops kept for texture only. ctx_crops no longer used.
+            Signature unchanged — all callers work without modification.
         
         Returns:
             Combined feature tensor (N, feature_dim)
         """
-        feat_obj = self.extract_dino_features(obj_crops, force_cpu=force_cpu)
-        feat_ctx = self.extract_dino_features(ctx_crops, force_cpu=force_cpu)
-        
-        geom = self._extract_geometric_features(boxes, image_source.shape)
-        geom = geom.to(feat_obj.device)
+        roi_feats = self.extract_roi_patch_features(image_source, boxes, force_cpu=force_cpu) # (N, 5120)
+        geom      = self._extract_geometric_features(boxes, image_source.shape).float() # (N, 10)
+        texture   = self._extract_texture_features(obj_crops).float() # (N, 2)
 
-        texture = self._extract_texture_features(obj_crops)
-        texture = texture.to(feat_obj.device)
-        
-        return torch.cat([feat_obj, feat_ctx, geom, texture], dim=1)
-
+        return torch.cat([roi_feats, geom, texture], dim=1)   # (N, 5132)
     # def _extract_context_features(self, images, force_cpu=False):
     #     """
     #     Returns [DINO_Object (1024) | CLIP_Context (512)]
@@ -1209,7 +1563,6 @@ class AnnotateEngine:
     def filter_candidates(self, image_source, boxes, classifier, confidence_threshold=0.5, force_cpu=False, use_tta=True):
         if len(boxes) == 0 or classifier is None: return boxes, None
         
-        # 1. Setup
         if isinstance(boxes, np.ndarray):
             boxes_t = torch.from_numpy(boxes).float()
         else:
@@ -1218,107 +1571,54 @@ class AnnotateEngine:
         n_candidates = len(boxes_t)
         final_probs = np.zeros(n_candidates, dtype=np.float32)
         
-        # 2. Process in Strict Batches (Chunk Size 64 = ~150MB RAM usage, safe for WSL)
         BATCH_SIZE = 64
         augmentor = Augmentor()
         
-        # Switch model context ONCE to avoid overhead
         print(f"--> [Filter] Processing {n_candidates} candidates in batches of {BATCH_SIZE}...")
 
         for i in range(0, n_candidates, BATCH_SIZE):
             batch_boxes = boxes_t[i : i + BATCH_SIZE]
             
-            obj_crops, ctx_crops = self._get_dual_crops(image_source, batch_boxes)
+            obj_crops, _ = self._get_dual_crops(image_source, batch_boxes)
             if not obj_crops: continue
             
-            base_feats = self._extract_features(image_source,batch_boxes,obj_crops,ctx_crops,force_cpu=force_cpu).cpu().numpy()
+            base_feats = self._extract_features(image_source, batch_boxes, obj_crops, [], force_cpu=force_cpu).cpu().numpy()
             batch_probs = classifier.predict_proba(base_feats)[:, 1]
 
             if use_tta:
-                jit_tf = augmentor.transforms.transforms[0]
                 flip_tf = augmentor.transforms.transforms[1]
+                jit_tf  = augmentor.transforms.transforms[0]
 
-                obj_flip = [flip_tf(img) for img in obj_crops]
-                ctx_flip = [flip_tf(img) for img in ctx_crops]
-                
-                feats_flip = self._extract_features(image_source,batch_boxes,obj_flip,ctx_flip,force_cpu=force_cpu).cpu().numpy()
+                obj_flip  = [flip_tf(img) for img in obj_crops]
+                feats_flip = self._extract_features(image_source, batch_boxes, obj_flip, [], force_cpu=force_cpu).cpu().numpy()
                 probs_flip = classifier.predict_proba(feats_flip)[:, 1]
 
-                obj_jit = [jit_tf(img) for img in obj_crops]
-                ctx_jit = [jit_tf(img) for img in ctx_crops]
-                
-                feats_jit = self._extract_features(image_source,batch_boxes,obj_jit,ctx_jit,force_cpu=force_cpu).cpu().numpy()
+                obj_jit  = [jit_tf(img) for img in obj_crops]
+                feats_jit = self._extract_features(image_source, batch_boxes, obj_jit, [], force_cpu=force_cpu).cpu().numpy()
                 probs_jit = classifier.predict_proba(feats_jit)[:, 1]
 
                 batch_probs = (batch_probs * 0.50) + (probs_flip * 0.25) + (probs_jit * 0.25)
 
-                del obj_flip, ctx_flip, feats_flip
-                del obj_jit, ctx_jit, feats_jit
+                del obj_flip, feats_flip, obj_jit, feats_jit
             
             final_probs[i : i + BATCH_SIZE] = batch_probs
-            
-            del obj_crops, ctx_crops, base_feats
-            
+            del obj_crops, base_feats
+
             if i % (BATCH_SIZE * 5) == 0:
                 gc.collect()
 
-        if isinstance(boxes, torch.Tensor):
-            boxes_np = boxes.cpu().numpy()
-        else:
-            boxes_np = boxes
-            
-        areas = boxes_np[:, 2] * boxes_np[:, 3]
-
-        tiny = areas < self.size_thresholds['tiny']
-        small = (areas >= self.size_thresholds['tiny']) & (areas < self.size_thresholds['small'])
-        normal = (areas >= self.size_thresholds['small']) & (areas < self.size_thresholds['normal_max'])
-        large = (areas >= self.size_thresholds['normal_max']) & (areas < self.size_thresholds['very_large'])
-        very_large = areas >= self.size_thresholds['very_large']
-        
-        keep_mask = np.zeros(len(areas), dtype=bool)
-        
-        if tiny.any():
-            adj_threshold = confidence_threshold + self.threshold_adjustments['tiny']
-            keep_mask[tiny] = final_probs[tiny] > adj_threshold
-        
-        if small.any():
-            adj_threshold = confidence_threshold + self.threshold_adjustments['small']
-            keep_mask[small] = final_probs[small] > adj_threshold
-        
-        if normal.any():
-            adj_threshold = confidence_threshold + self.threshold_adjustments['normal']
-            keep_mask[normal] = final_probs[normal] > adj_threshold
-        
-        if large.any():
-            adj_threshold = confidence_threshold + self.threshold_adjustments['large']
-            keep_mask[large] = final_probs[large] > adj_threshold
-        
-        if very_large.any():
-            adj_threshold = min(
-                confidence_threshold + self.threshold_adjustments['very_large'], 
-                0.95
-            )
-            keep_mask[very_large] = final_probs[very_large] > adj_threshold
-        
-        rescued = np.sum(keep_mask & (final_probs < confidence_threshold))
-        rejected = np.sum(~keep_mask & (final_probs > confidence_threshold))
-        
-        if rescued > 0:
-            print(f"      → Rescued {rescued} small objects")
-        if rejected > 0:
-            print(f"      → Rejected {rejected} large objects")
-
-        keep_boxes = boxes_t[keep_mask]
-        keep_scores = torch.tensor(final_probs[keep_mask])
+        # Single clean threshold — trust the model
+        keep_mask    = final_probs > confidence_threshold
+        keep_boxes   = boxes_t[keep_mask]
+        keep_scores  = torch.tensor(final_probs[keep_mask])
         reject_boxes = boxes_t[~keep_mask]
         reject_scores = torch.tensor(final_probs[~keep_mask])
 
-        print(f"    [Filter] SVM rejected {len(boxes) - len(keep_boxes)} false positives.")
-        
-        # Explicit final cleanup
+        print(f"    [Filter] Rejected {(~keep_mask).sum()} / {n_candidates} candidates.")
+
         gc.collect()
         torch.cuda.empty_cache()
-        
+
         return keep_boxes, keep_scores, reject_boxes, reject_scores
 
     def _pad_for_visualization(self, image, boxes_xyxy, masks, padding=60):
@@ -1379,30 +1679,50 @@ class AnnotateEngine:
     def generate_masks(self, image_source, boxes, logits=None, debug=False):
         if len(boxes) == 0: return None, None
         self.model_manager.switch_to('sam')
-        
-        print(f"--> [Step 3] Segmenting with SAM 2...")
+
+        print("--> [Step 3] Segmenting with SAM 2...")
         h, w, _ = image_source.shape
-        boxes_cxcywh = boxes.clone() 
+        
+        boxes_cxcywh = boxes.clone()
         boxes_xyxy = boxes.clone()
         boxes_xyxy[:, 0] = (boxes_cxcywh[:, 0] - boxes_cxcywh[:, 2] / 2) * w
         boxes_xyxy[:, 1] = (boxes_cxcywh[:, 1] - boxes_cxcywh[:, 3] / 2) * h
         boxes_xyxy[:, 2] = (boxes_cxcywh[:, 0] + boxes_cxcywh[:, 2] / 2) * w
         boxes_xyxy[:, 3] = (boxes_cxcywh[:, 1] + boxes_cxcywh[:, 3] / 2) * h
 
+        self.model_manager.sam_predictor.reset_predictor()
+        gc.collect()
+        torch.cuda.empty_cache()
+
         self.model_manager.sam_predictor.set_image(image_source)
-        
-        masks, scores, _ = self.model_manager.sam_predictor.predict(
-            point_coords=None, point_labels=None,
-            box=boxes_xyxy.numpy(), multimask_output=False
-        )
-        if masks.ndim == 4: masks = masks.squeeze(1)
+
+        # Batch predict — mask decoder memory scales with N boxes
+        SAM_BATCH = 16
+        all_masks = []
+        boxes_np = boxes_xyxy.numpy()
+
+        for i in range(0, len(boxes_np), SAM_BATCH):
+            batch = boxes_np[i : i + SAM_BATCH]
+            masks_batch, _, _ = self.model_manager.sam_predictor.predict(
+                point_coords=None, point_labels=None,
+                box=batch, multimask_output=False
+            )
+            if masks_batch.ndim == 4:
+                masks_batch = masks_batch.squeeze(1)
+            all_masks.append(masks_batch)
+
+        # Release image features immediately after all batches done
+        self.model_manager.sam_predictor.reset_predictor()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        masks = np.concatenate(all_masks, axis=0)
 
         if debug:
-            if logits is None: debug_logits = torch.ones(len(boxes))
-            else: debug_logits = logits
-            self.visualize_debug(image_source, boxes_xyxy.numpy(), masks, debug_logits, use_padding=True)
-        
-        return boxes_xyxy.numpy(), masks
+            debug_logits = logits if logits is not None else torch.ones(len(boxes))
+            self.visualize_debug(image_source, boxes_np, masks, debug_logits, use_padding=True)
+
+        return boxes_np, masks
 
     def save_result(self, image_source, boxes_xyxy, masks, logits, file_name="result.jpg", use_padding=False, show_boxes = False):
         if use_padding:
