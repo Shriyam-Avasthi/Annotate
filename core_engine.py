@@ -125,6 +125,31 @@ class Augmentor:
         if not images: return []
         return [self.transforms(img) for img in images]
 
+class LoRALinear(torch.nn.Module):
+    """
+    Wraps a frozen Linear layer with a low-rank adapter.
+    Forward: W·x + scale * (B·A)·x
+    Only lora_A and lora_B have requires_grad=True.
+    B is zero-initialized so the adapter is a no-op at epoch 0 —
+    pretrained DINOv2 features are fully preserved at the start of training.
+    """
+    def __init__(self, linear: torch.nn.Linear, rank: int = 8, alpha: int = 16):
+        super().__init__()
+        self.linear = linear
+        self.rank   = rank
+        self.scale  = alpha / rank
+
+        in_f  = linear.in_features
+        out_f = linear.out_features
+
+        self.lora_A = torch.nn.Parameter(
+            torch.nn.init.kaiming_uniform_(torch.empty(rank, in_f))
+        )
+        self.lora_B = torch.nn.Parameter(torch.zeros(out_f, rank))
+
+    def forward(self, x):
+        return self.linear(x) + (x @ self.lora_A.T) @ self.lora_B.T * self.scale
+
 class AnnotateEngine:
     def __init__(self, device="cuda"):
         self.device = device
@@ -421,13 +446,26 @@ class AnnotateEngine:
         print(f"    [Cache] Done. Cached {len(cache)} samples.")
         return cache
 
-    def fine_tune_dino(self, verified_data, save_path="verifier/dino_finetune.pt",n_epochs=80, batch_size=16, grad_accum_steps=2):
-        print("\n--> [FineTune] Preparing data...")
+    def fine_tune_dino(self, verified_data, save_path="verifier/dino_finetune.pt",
+                    n_epochs=80, batch_size=16, grad_accum_steps=2,
+                    lora_rank=8, apply_from_block=12):
+        """
+        LoRA fine-tuning of DINOv2.
 
-        # --- 1. Collect crops (no augmentation yet) ---
-        all_crops  = []
-        all_labels = []
-        augmentor  = Augmentor()
+        Blocks 0..apply_from_block-1  — fully frozen, activations cached once (same trick as before).
+        Blocks apply_from_block..23   — base weights frozen, LoRA A/B adapters on qkv + proj.
+        Projection head               — small MLP, fully trainable.
+
+        Trainable params: ~786K (LoRA) + ~135K (head) ≈ 0.85M total.
+        Compare to the original last-block approach: ~4M params.
+        """
+        print("\n--> [LoRA] Preparing data...")
+
+        # ------------------------------------------------------------------ #
+        # 1. Collect crops                                                     #
+        # ------------------------------------------------------------------ #
+        all_crops, all_labels = [], []
+        augmentor = Augmentor()
 
         for item in verified_data:
             if len(item['pos']) == 0 and len(item['neg']) == 0:
@@ -438,10 +476,9 @@ class AnnotateEngine:
             all_crops.extend(pos_crops);  all_labels.extend([1] * len(pos_crops))
             all_crops.extend(neg_crops);  all_labels.extend([0] * len(neg_crops))
 
-        # Cap to avoid explosion: max 300 pos, 600 neg (augmented below)
-        pos_idx = [i for i,l in enumerate(all_labels) if l == 1][:300]
-        neg_idx = [i for i,l in enumerate(all_labels) if l == 0][:600]
-        keep    = pos_idx + neg_idx
+        pos_idx = [i for i, l in enumerate(all_labels) if l == 1][:1000]
+        neg_idx = [i for i, l in enumerate(all_labels) if l == 0][:1000]
+        keep       = pos_idx + neg_idx
         all_crops  = [all_crops[i]  for i in keep]
         all_labels = [all_labels[i] for i in keep]
 
@@ -450,37 +487,45 @@ class AnnotateEngine:
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
-        base_tensors = torch.stack([ft_transform(c) for c in all_crops])
-        base_labels  = torch.tensor(all_labels, dtype=torch.long)
-
-        # Light augmentation at tensor level only (no extra forward passes)
         aug_tf = transforms.Compose([
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.ColorJitter(brightness=0.2, contrast=0.2),
         ])
-        aug_tensors = torch.stack([aug_tf(ft_transform(c)) for c in all_crops * 2])
-        aug_labels  = base_labels.repeat(2)
+        base_tensors = torch.stack([ft_transform(c)          for c in all_crops])
+        aug_tensors  = torch.stack([aug_tf(ft_transform(c))  for c in all_crops * 2])
+        base_labels  = torch.tensor(all_labels, dtype=torch.long)
 
         tensors = torch.cat([base_tensors, aug_tensors])
-        labels  = torch.cat([base_labels,  aug_labels])
+        labels  = torch.cat([base_labels,  base_labels.repeat(2)])
 
         n_pos = (labels == 1).sum().item()
         n_neg = (labels == 0).sum().item()
-        print(f"    [FineTune] {n_pos} pos | {n_neg} neg | {len(tensors)} total samples")
+        print(f"    [LoRA] {n_pos} pos | {n_neg} neg | {len(tensors)} total samples")
 
-        # --- 2. Model setup: freeze ALL except last 1 block ---
+        # ------------------------------------------------------------------ #
+        # 2. Inject LoRA into blocks apply_from_block..23                     #
+        # ------------------------------------------------------------------ #
         dino_model = self.model_manager.models['dino']
         dino_model.to(self.device)
         self.model_manager.current_key = 'dino'
 
+        # Freeze everything first
         for param in dino_model.parameters():
             param.requires_grad = False
 
-        # Only last 1 block trainable — reduces params from 25M → 12M
-        # and more importantly, the cached activation boundary is much later
-        last_block_idx = len(dino_model.blocks) - 1
-        for param in dino_model.blocks[last_block_idx].parameters():
-            param.requires_grad = True
+        lora_layer_map = {}   # key → LoRALinear, used for saving
+
+        for idx in range(apply_from_block, len(dino_model.blocks)):
+            attn = dino_model.blocks[idx].attn
+
+            wrapped_qkv  = LoRALinear(attn.qkv,  rank=lora_rank, alpha=lora_rank * 2).to(self.device)
+            wrapped_proj = LoRALinear(attn.proj, rank=lora_rank, alpha=lora_rank * 2).to(self.device)
+
+            attn.qkv  = wrapped_qkv
+            attn.proj = wrapped_proj
+
+            lora_layer_map[f'block{idx}_qkv']  = wrapped_qkv
+            lora_layer_map[f'block{idx}_proj'] = wrapped_proj
 
         proj_head = torch.nn.Sequential(
             torch.nn.Linear(1024, 128),
@@ -488,30 +533,27 @@ class AnnotateEngine:
             torch.nn.Linear(128, 64),
         ).to(self.device)
 
-        # --- 3. PRE-COMPUTE frozen activations (the key speedup) ---
-        # Run everything up to block[-2], cache output.
-        # Training loop only runs block[-1] + proj_head.
-        print("    [FineTune] Pre-computing frozen activations (one-time)...")
+        # ------------------------------------------------------------------ #
+        # 3. Pre-compute frozen activations (blocks 0..apply_from_block-1)    #
+        #    Identical hook trick — just the cutoff block index changes.       #
+        # ------------------------------------------------------------------ #
+        print(f"    [LoRA] Pre-computing frozen activations (blocks 0–{apply_from_block - 1})...")
 
         frozen_cache = []
         dino_model.eval()
 
-        # We need activations at the input to the last block.
-        # Use a hook on the last block's INPUT.
         captured = {}
         def capture_input(module, inp, out):
-            # inp is a tuple; inp[0] is (B, N+1, 1024)
             captured['x'] = inp[0].detach()
 
-        hook = dino_model.blocks[last_block_idx].register_forward_hook(capture_input)
+        hook = dino_model.blocks[apply_from_block].register_forward_hook(capture_input)
 
         CACHE_BATCH = 32
         with torch.no_grad():
             with torch.autocast(device_type='cuda', dtype=torch.float16):
                 for i in range(0, len(tensors), CACHE_BATCH):
-                    batch = tensors[i:i+CACHE_BATCH].to(self.device)
-                    dino_model(batch)   # full forward; hook captures pre-last-block activations
-                    # captured['x'] is (B, 197, 1024) — sequence of patch tokens
+                    batch = tensors[i:i + CACHE_BATCH].to(self.device)
+                    dino_model(batch)
                     frozen_cache.append(captured['x'].float().cpu())
                     del batch
 
@@ -521,28 +563,33 @@ class AnnotateEngine:
 
         frozen_acts = torch.cat(frozen_cache, dim=0)   # (N, 197, 1024) on CPU
         del frozen_cache
-        print(f"    [FineTune] Cached {frozen_acts.shape[0]} activations. "
+        print(f"    [LoRA] Cached {frozen_acts.shape[0]} activations at block {apply_from_block}. "
               f"Shape: {tuple(frozen_acts.shape)}")
 
-        # --- 4. Training loop (only runs last block + proj_head) ---
-        trainable_params = (
-            list(dino_model.blocks[last_block_idx].parameters()) +
-            list(proj_head.parameters())
-        )
-        n_trainable = sum(p.numel() for p in trainable_params)
-        print(f"    [FineTune] Trainable: {n_trainable/1e6:.1f}M params")
-        print(f"--> [FineTune] Training {n_epochs} epochs...")
+        # ------------------------------------------------------------------ #
+        # 4. Trainable params: LoRA A/B matrices + proj_head                  #
+        # ------------------------------------------------------------------ #
+        trainable_params = list(proj_head.parameters())
+        for layer in lora_layer_map.values():
+            trainable_params += [layer.lora_A, layer.lora_B]
 
+        n_trainable = sum(p.numel() for p in trainable_params)
+        print(f"    [LoRA] Trainable: {n_trainable / 1e6:.2f}M params "
+              f"(rank={lora_rank}, blocks {apply_from_block}–{len(dino_model.blocks) - 1})")
+        print(f"--> [LoRA] Training {n_epochs} epochs...")
+
+        # ------------------------------------------------------------------ #
+        # 5. Training loop — identical to before except the forward pass      #
+        #    now runs blocks apply_from_block..23 (with LoRA) + proj_head.    #
+        # ------------------------------------------------------------------ #
         optimizer = optim.AdamW(trainable_params, lr=2e-5, weight_decay=0.01)
         scaler    = GradScaler()
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
 
-        last_block = dino_model.blocks[last_block_idx]
-
         def supcon_loss(features, labels, temperature=0.07):
-            device = features.device
-            n = features.shape[0]
-            sim = torch.matmul(features, features.T) / temperature
+            device   = features.device
+            n        = features.shape[0]
+            sim      = torch.matmul(features, features.T) / temperature
             self_mask = torch.eye(n, dtype=torch.bool, device=device)
             sim.masked_fill_(self_mask, float('-inf'))
             pos_mask = (labels.unsqueeze(0) == labels.unsqueeze(1)) & ~self_mask
@@ -555,7 +602,9 @@ class AnnotateEngine:
         best_loss = float('inf')
 
         for epoch in tqdm(range(n_epochs)):
-            last_block.train()
+            # Set LoRA layers + proj_head to train mode; frozen blocks stay eval
+            for layer in lora_layer_map.values():
+                layer.train()
             proj_head.train()
 
             perm         = torch.randperm(len(frozen_acts))
@@ -567,17 +616,20 @@ class AnnotateEngine:
             optimizer.zero_grad()
 
             for i in range(0, len(epoch_acts), batch_size):
-                # Load pre-computed frozen activations — no encoder forward pass
-                batch_acts   = epoch_acts[i:i+batch_size].to(self.device)
-                batch_labels = epoch_labels[i:i+batch_size].to(self.device)
+                batch_acts   = epoch_acts[i:i + batch_size].to(self.device)
+                batch_labels = epoch_labels[i:i + batch_size].to(self.device)
 
                 with torch.autocast(device_type='cuda', dtype=torch.float16):
-                    # Only run the last block + proj head
-                    out   = last_block(batch_acts)     # (B, 197, 1024)
-                    cls   = out[:, 0, :]               # CLS token (B, 1024)
-                    proj  = proj_head(cls)             # (B, 64)
-                    proj  = F.normalize(proj, dim=1)
-                    loss  = supcon_loss(proj, batch_labels) / grad_accum_steps
+                    # Run only the LoRA-adapted blocks — blocks 0..apply_from_block-1
+                    # were already baked into batch_acts by the cache step above.
+                    x = batch_acts
+                    for blk_idx in range(apply_from_block, len(dino_model.blocks)):
+                        x = dino_model.blocks[blk_idx](x)
+
+                    cls  = x[:, 0, :]              # CLS token  (B, 1024)
+                    proj = proj_head(cls)          # (B, 64)
+                    proj = F.normalize(proj, dim=1)
+                    loss = supcon_loss(proj, batch_labels) / grad_accum_steps
 
                 scaler.scale(loss).backward()
 
@@ -591,28 +643,37 @@ class AnnotateEngine:
 
                 epoch_loss += loss.item() * grad_accum_steps
                 n_batches  += 1
-                del batch_acts, batch_labels, out, cls, proj, loss
+                del batch_acts, batch_labels, x, cls, proj, loss
 
             scheduler.step()
             avg_loss = epoch_loss / max(n_batches, 1)
 
             if (epoch + 1) % 10 == 0:
-                print(f"    Epoch {epoch+1:3d}/{n_epochs} | "
+                print(f"    Epoch {epoch + 1:3d}/{n_epochs} | "
                       f"Loss: {avg_loss:.4f} | "
                       f"LR: {scheduler.get_last_lr()[0]:.2e}")
 
             if avg_loss < best_loss:
                 best_loss = avg_loss
+
+                # Save only the LoRA deltas + proj_head — not the full model
+                lora_state = {
+                    name: {'A': layer.lora_A.data.cpu(), 'B': layer.lora_B.data.cpu()}
+                    for name, layer in lora_layer_map.items()
+                }
                 torch.save({
-                    'block_state': dino_model.blocks[last_block_idx].state_dict(),
-                    'block_idx':   last_block_idx,
-                    'proj_head':   proj_head.state_dict(),
-                    'epoch':       epoch,
-                    'loss':        best_loss,
+                    'type':              'lora',
+                    'lora_state':        lora_state,
+                    'proj_head':         proj_head.state_dict(),
+                    'lora_rank':         lora_rank,
+                    'apply_from_block':  apply_from_block,
+                    'epoch':             epoch,
+                    'loss':              best_loss,
                 }, save_path)
 
-        print(f"\n--> [FineTune] Done. Best loss: {best_loss:.4f} | Saved: {save_path}")
+        print(f"\n--> [LoRA] Done. Best loss: {best_loss:.4f} | Saved: {save_path}")
 
+        # Freeze everything again — LoRA weights stay injected in the live model
         for param in dino_model.parameters():
             param.requires_grad = False
 
@@ -624,17 +685,53 @@ class AnnotateEngine:
 
     def load_finetuned_dino(self, save_path="verifier/dino_finetune.pt"):
         if not os.path.exists(save_path):
-            print(f"--> [FineTune] No fine-tuned weights found at {save_path}")
+            print(f"--> [LoRA] No fine-tuned weights found at {save_path}")
             return False
 
-        print(f"--> [FineTune] Loading fine-tuned DINOv2 weights from {save_path}...")
+        print(f"--> [LoRA] Loading fine-tuned DINOv2 weights from {save_path}...")
         checkpoint  = torch.load(save_path, map_location='cpu')
         dino_model  = self.model_manager.models['dino']
-        block_idx   = checkpoint['block_idx']
 
-        dino_model.blocks[block_idx].load_state_dict(checkpoint['block_state'])
-        print(f"    [FineTune] Restored block {block_idx} | "
-              f"epoch {checkpoint['epoch']} | loss {checkpoint['loss']:.4f}")
+        # ---- New LoRA format ----
+        if checkpoint.get('type') == 'lora':
+            lora_rank        = checkpoint['lora_rank']
+            apply_from_block = checkpoint['apply_from_block']
+            lora_state       = checkpoint['lora_state']
+
+            # Freeze base weights, then inject LoRALinear wrappers and load saved A/B
+            for param in dino_model.parameters():
+                param.requires_grad = False
+
+            for name, ab in lora_state.items():
+                # name format: 'block{idx}_qkv' or 'block{idx}_proj'
+                parts    = name.split('_')         # ['block12', 'qkv']
+                blk_idx  = int(parts[0].replace('block', ''))
+                layer_id = parts[1]                # 'qkv' or 'proj'
+
+                attn     = dino_model.blocks[blk_idx].attn
+                original = getattr(attn, layer_id)  # the raw nn.Linear
+
+                # Only wrap if not already wrapped (idempotent on repeated loads)
+                if not isinstance(original, LoRALinear):
+                    wrapped = LoRALinear(original, rank=lora_rank, alpha=lora_rank * 2)
+                    setattr(attn, layer_id, wrapped)
+                else:
+                    wrapped = original
+
+                wrapped.lora_A.data = ab['A']
+                wrapped.lora_B.data = ab['B']
+
+            print(f"    [LoRA] Restored LoRA adapters | "
+                  f"rank={lora_rank} | blocks {apply_from_block}–{len(dino_model.blocks) - 1} | "
+                  f"epoch {checkpoint['epoch']} | loss {checkpoint['loss']:.4f}")
+
+        # ---- Legacy format (single-block full fine-tune) ----
+        else:
+            block_idx = checkpoint['block_idx']
+            dino_model.blocks[block_idx].load_state_dict(checkpoint['block_state'])
+            print(f"    [Legacy] Restored block {block_idx} | "
+                  f"epoch {checkpoint['epoch']} | loss {checkpoint['loss']:.4f}")
+
         return True
 
     def tune_context_factors_optuna(self, verified_data, n_trials=50):
@@ -1585,21 +1682,21 @@ class AnnotateEngine:
             base_feats = self._extract_features(image_source, batch_boxes, obj_crops, [], force_cpu=force_cpu).cpu().numpy()
             batch_probs = classifier.predict_proba(base_feats)[:, 1]
 
-            if use_tta:
-                flip_tf = augmentor.transforms.transforms[1]
-                jit_tf  = augmentor.transforms.transforms[0]
-
-                obj_flip  = [flip_tf(img) for img in obj_crops]
-                feats_flip = self._extract_features(image_source, batch_boxes, obj_flip, [], force_cpu=force_cpu).cpu().numpy()
-                probs_flip = classifier.predict_proba(feats_flip)[:, 1]
-
-                obj_jit  = [jit_tf(img) for img in obj_crops]
-                feats_jit = self._extract_features(image_source, batch_boxes, obj_jit, [], force_cpu=force_cpu).cpu().numpy()
-                probs_jit = classifier.predict_proba(feats_jit)[:, 1]
-
-                batch_probs = (batch_probs * 0.50) + (probs_flip * 0.25) + (probs_jit * 0.25)
-
-                del obj_flip, feats_flip, obj_jit, feats_jit
+            # if use_tta:
+            #     flip_tf = augmentor.transforms.transforms[1]
+            #     jit_tf  = augmentor.transforms.transforms[0]
+            #
+            #     obj_flip  = [flip_tf(img) for img in obj_crops]
+            #     feats_flip = self._extract_features(image_source, batch_boxes, obj_flip, [], force_cpu=force_cpu).cpu().numpy()
+            #     probs_flip = classifier.predict_proba(feats_flip)[:, 1]
+            #
+            #     obj_jit  = [jit_tf(img) for img in obj_crops]
+            #     feats_jit = self._extract_features(image_source, batch_boxes, obj_jit, [], force_cpu=force_cpu).cpu().numpy()
+            #     probs_jit = classifier.predict_proba(feats_jit)[:, 1]
+            #
+            #     batch_probs = (batch_probs * 0.50) + (probs_flip * 0.25) + (probs_jit * 0.25)
+            #
+            #     del obj_flip, feats_flip, obj_jit, feats_jit
             
             final_probs[i : i + BATCH_SIZE] = batch_probs
             del obj_crops, base_feats

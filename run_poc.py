@@ -9,15 +9,15 @@ import torch
 from scout import Scout
 import gc
 
-TARGET_IMAGE = "assets/test-4.jpg"
+TARGET_IMAGE = "assets/test-7.jpg"
 ANCHOR_DIR = "assets/anchors/Extra/"
 TEXT_PROMPT = "A pothole."
 FINETUNE_PATH = "verifier/dino_finetune.pt"
 
 MODEL_PKG_PATH = "verifier/pothole_verifier_v17.pkl"
 # This is the new file where we will save the boxes/paths
-# DATASET_PATH = "verifier/pothole_training_data_2.json"
-DATASET_PATH = None
+DATASET_PATH = "verifier/pothole_training_data.json"
+# DATASET_PATH = None
 
 def save_dataset(verified_data, output_path):
     """Saves the verification data (paths and tensors) to a JSON file."""
