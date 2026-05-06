@@ -71,8 +71,8 @@ class EnsembleVerifier:
         )
         
         clf_knn = KNeighborsClassifier(
-            n_neighbors=7,  # Middle ground
-            weights='distance',  # Weight by inverse distance
+            n_neighbors=7,
+            weights='distance',
             metric='cosine'
         )
         

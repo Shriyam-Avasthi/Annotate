@@ -9,15 +9,14 @@ import torch
 from scout import Scout
 import gc
 
-TARGET_IMAGE = "assets/test_images/test-7.jpg"
+TARGET_DIR = "assets/test_images/"  # Directory containing images to process
+OUTPUT_DIR = "outputs/"             # Directory to save the results
 ANCHOR_DIR = "assets/anchors/Extra/"
 TEXT_PROMPT = "A pothole."
 FINETUNE_PATH = "verifier/dino_finetune.pt"
 
 MODEL_PKG_PATH = "verifier/pothole_verifier_v17.pkl"
-# This is the new file where we will save the boxes/paths
-DATASET_PATH = "verifier/pothole_training_data.json"
-# DATASET_PATH = None
+DATASET_PATH = None
 
 def save_dataset(verified_data, output_path):
     """Saves the verification data (paths and tensors) to a JSON file."""
@@ -27,7 +26,9 @@ def save_dataset(verified_data, output_path):
         neg = item['neg']
 
         def to_list(data):
-            if isinstance(data, torch.Tensor) or isinstance(data, np.ndarray):
+            if isinstance(data, torch.Tensor):
+                return data.tolist()
+            elif isinstance(data, np.ndarray):
                 return data.tolist()
             return data
 
@@ -64,25 +65,17 @@ def load_dataset(input_path):
 
 def main():
     engine = AnnotateEngine()
-    # scout = Scout(engine)
-    # debugger = VisualDebugger()
-    finetuned_model_found = engine.load_finetuned_dino(FINETUNE_PATH)
+    engine.load_finetuned_dino(FINETUNE_PATH)
 
     verifier_pkg = engine.load_verifier(MODEL_PKG_PATH)
     saved_dataset = load_dataset(DATASET_PATH)
     
     train_metadata = None
-    # print(engine.model_manager.models['dino'].blocks[-1].attn)
 
     if saved_dataset is not None:
         print(f"--> [Setup] Found saved dataset ({len(saved_dataset)} images). Skipping manual calibration.")
-        if not finetuned_model_found:
-            engine.fine_tune_dino(saved_dataset, save_path=FINETUNE_PATH, n_epochs=150, apply_from_block=20) 
-
-            engine.calibrate_size_thresholds(saved_dataset)
-
-        # n_trials = 50
-        # study = engine.tune_context_factors_optuna(saved_dataset, n_trials=n_trials)
+        engine.fine_tune_dino(saved_dataset, save_path=FINETUNE_PATH, n_epochs=80, apply_from_block=20)
+        engine.calibrate_size_thresholds(saved_dataset)
 
         verifier_model, X_train, y_train, train_metadata = engine.train_verifier(
             saved_dataset, save_path=MODEL_PKG_PATH, fast_train=False
@@ -96,8 +89,7 @@ def main():
         }
 
     elif verifier_pkg is None:
-        if not finetuned_model_found:
-            engine.load_finetuned_dino(FINETUNE_PATH)
+        engine.load_finetuned_dino(FINETUNE_PATH)
         print("--> [Calibrate] No saved model or dataset found. Starting calibration...")
         anchor_files = glob.glob(os.path.join(ANCHOR_DIR, "*.*"))
         
@@ -117,18 +109,15 @@ def main():
 
         if verified_data and len(verified_data) > 0:
             engine.calibrate_size_thresholds(verified_data)
-
             save_dataset(verified_data, DATASET_PATH)
-            
             verifier_pkg = engine.load_verifier(MODEL_PKG_PATH)
         else:
             print("[Abort] Calibration cancelled or no data collected.")
             return
 
     else:
-        if not finetuned_model_found:
-            print("--> [Error] Couldn't find a finetuned model or the dataset. Exiting...")
-            return
+        engine.load_finetuned_dino(FINETUNE_PATH)
+        print("--> [Setup] Loaded cached model directly (No retraining).")
 
     if verifier_pkg is None:
         print("[Error] Failed to load or train a verifier.")
@@ -137,47 +126,77 @@ def main():
     engine.load_finetuned_dino(FINETUNE_PATH)
 
     verifier_model = verifier_pkg['model']
-    X_train = verifier_pkg['X']
-    y_train = verifier_pkg['y']
-    train_metadata = verifier_pkg.get('meta', None)
-
-    print(f"\n--> Processing Target: {TARGET_IMAGE}")
     
-    boxes, logits, _, image_source = engine.detect_objects(
-        TARGET_IMAGE, 
-        TEXT_PROMPT,
-        box_threshold=0.05,
-        text_threshold=0.20,
-        batch_size=4
-    )
+    # --- BATCH PROCESSING LOGIC ---
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
+    # Grab all typical image formats from the target directory
+    image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.webp']
+    target_images = []
+    for ext in image_extensions:
+        target_images.extend(glob.glob(os.path.join(TARGET_DIR, ext)))
+        
+    if not target_images:
+        print(f"[Warning] No images found in directory: {TARGET_DIR}")
+        return
+        
+    print(f"\n--> Starting batch processing for {len(target_images)} images...")
 
-    if len(boxes) > 0:
-        filtered_boxes, svm_scores, reject_boxes, reject_scores = engine.filter_candidates(image_source, boxes, verifier_model, confidence_threshold=0.5, force_cpu=False)
-
-        # Visualize rejected boxes
-        rej_boxes_xyxy, rej_masks = engine.generate_masks(image_source, reject_boxes, logits=reject_scores, debug=False)
-
-        if rej_boxes_xyxy is not None:
-            engine.save_result(
-                image_source, rej_boxes_xyxy, rej_masks, reject_scores,
-                file_name="rejected_by_svm.jpg", use_padding=True, show_boxes=True
+    for img_path in target_images:
+        base_name = os.path.basename(img_path).split('.')[0]
+        print(f"\n--> Processing Target: {img_path}")
+        
+        try:
+            boxes, logits, _, image_source = engine.detect_objects(
+                img_path, 
+                TEXT_PROMPT,
+                box_threshold=0.05,
+                text_threshold=0.20,
+                batch_size=4
             )
-            
-        del rej_boxes_xyxy, rej_masks, reject_boxes, reject_scores
-        gc.collect()
-        torch.cuda.empty_cache()
 
-        boxes_xyxy, masks = engine.generate_masks(
-            image_source, filtered_boxes, logits=svm_scores, debug=False
-        )
+            if len(boxes) > 0:
+                filtered_boxes, svm_scores, reject_boxes, reject_scores = engine.filter_candidates(
+                    image_source, boxes, verifier_model, confidence_threshold=0.5, force_cpu=False
+                )
 
-        if boxes_xyxy is not None:
-            engine.save_result(
-                image_source, boxes_xyxy, masks, svm_scores, 
-                file_name="calibrated_result.jpg", use_padding=True, show_boxes=False
-            )
-        else:
-            print("No candidates detected.")
+                # Visualize rejected boxes
+                rej_boxes_xyxy, rej_masks = engine.generate_masks(image_source, reject_boxes, logits=reject_scores, debug=False)
+
+                if rej_boxes_xyxy is not None:
+                    engine.save_result(
+                        image_source, rej_boxes_xyxy, rej_masks, reject_scores,
+                        file_name=os.path.join(OUTPUT_DIR, f"{base_name}_rejected.jpg"), 
+                        use_padding=True, show_boxes=True
+                    )
+                    
+                del rej_boxes_xyxy, rej_masks, reject_boxes, reject_scores
+                
+                # Visualize accepted boxes
+                boxes_xyxy, masks = engine.generate_masks(
+                    image_source, filtered_boxes, logits=svm_scores, debug=False
+                )
+
+                if boxes_xyxy is not None:
+                    engine.save_result(
+                        image_source, boxes_xyxy, masks, svm_scores, 
+                        file_name=os.path.join(OUTPUT_DIR, f"{base_name}_calibrated.jpg"), 
+                        use_padding=True, show_boxes=False
+                    )
+                else:
+                    print(f"    No accepted candidates for {base_name}.")
+            else:
+                print(f"    No candidates initially detected for {base_name}.")
+                
+        except Exception as e:
+            print(f"[Error] Failed processing {img_path}: {e}")
+
+        finally:
+            # Explicit cleanup per iteration to prevent memory leaks
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    print("\n--> Batch processing complete!")
 
 if __name__ == "__main__":
     main()

@@ -16,6 +16,8 @@ from torch.cuda.amp import GradScaler
 # Grounding DINO Imports
 import groundingdino.datasets.transforms as T
 from groundingdino.util.inference import load_model, predict
+import random 
+import torchvision.transforms.functional as TF # Added for live augmentation
 
 from transformers import CLIPProcessor, CLIPModel
 
@@ -149,6 +151,13 @@ class LoRALinear(torch.nn.Module):
 
     def forward(self, x):
         return self.linear(x) + (x @ self.lora_A.T) @ self.lora_B.T * self.scale
+    @property
+    def in_features(self):
+        return self.linear.in_features
+
+    @property
+    def out_features(self):
+        return self.linear.out_features
 
 class AnnotateEngine:
     def __init__(self, device="cuda"):
@@ -165,7 +174,7 @@ class AnnotateEngine:
         sam_model = build_sam2(self.sam_config, self.sam_weights, device=self.cpu)
         sam_predictor = SAM2ImagePredictor(sam_model)
 
-        dino_model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14')
+        dino_model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14_reg')
         dino_model.to(self.cpu) # Keep on CPU until needed
         dino_model.eval()
         
@@ -447,194 +456,121 @@ class AnnotateEngine:
         return cache
 
     def fine_tune_dino(self, verified_data, save_path="verifier/dino_finetune.pt",
-                    n_epochs=80, batch_size=16, grad_accum_steps=2,
-                    lora_rank=8, apply_from_block=12):
-        """
-        LoRA fine-tuning of DINOv2.
+                       n_epochs=40, batch_size=16, grad_accum_steps=2,
+                       lora_rank=8, apply_from_block=20):
+        print("\n--> [LoRA] Preparing model for full-image fine-tuning...")
 
-        Blocks 0..apply_from_block-1  — fully frozen, activations cached once (same trick as before).
-        Blocks apply_from_block..23   — base weights frozen, LoRA A/B adapters on qkv + proj.
-        Projection head               — small MLP, fully trainable.
-
-        Trainable params: ~786K (LoRA) + ~135K (head) ≈ 0.85M total.
-        Compare to the original last-block approach: ~4M params.
-        """
-        print("\n--> [LoRA] Preparing data...")
-
-        # ------------------------------------------------------------------ #
-        # 1. Collect crops                                                     #
-        # ------------------------------------------------------------------ #
-        all_crops, all_labels = [], []
-        augmentor = Augmentor()
-
-        for item in verified_data:
-            if len(item['pos']) == 0 and len(item['neg']) == 0:
-                continue
-            image_source, _ = ImageProcessor.load_image(item['path'], self.STANDARD_IMAGE_SCALE)
-            pos_crops, _ = self._get_dual_crops(image_source, item['pos'])
-            neg_crops, _ = self._get_dual_crops(image_source, item['neg'])
-            all_crops.extend(pos_crops);  all_labels.extend([1] * len(pos_crops))
-            all_crops.extend(neg_crops);  all_labels.extend([0] * len(neg_crops))
-
-        pos_idx = [i for i, l in enumerate(all_labels) if l == 1][:1000]
-        neg_idx = [i for i, l in enumerate(all_labels) if l == 0][:1000]
-        keep       = pos_idx + neg_idx
-        all_crops  = [all_crops[i]  for i in keep]
-        all_labels = [all_labels[i] for i in keep]
-
-        ft_transform = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
-        aug_tf = transforms.Compose([
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2),
-        ])
-        base_tensors = torch.stack([ft_transform(c)          for c in all_crops])
-        aug_tensors  = torch.stack([aug_tf(ft_transform(c))  for c in all_crops * 2])
-        base_labels  = torch.tensor(all_labels, dtype=torch.long)
-
-        tensors = torch.cat([base_tensors, aug_tensors])
-        labels  = torch.cat([base_labels,  base_labels.repeat(2)])
-
-        n_pos = (labels == 1).sum().item()
-        n_neg = (labels == 0).sum().item()
-        print(f"    [LoRA] {n_pos} pos | {n_neg} neg | {len(tensors)} total samples")
-
-        # ------------------------------------------------------------------ #
-        # 2. Inject LoRA into blocks apply_from_block..23                     #
-        # ------------------------------------------------------------------ #
         dino_model = self.model_manager.models['dino']
         dino_model.to(self.device)
         self.model_manager.current_key = 'dino'
 
-        # Freeze everything first
+        # Freeze base model
         for param in dino_model.parameters():
             param.requires_grad = False
 
-        lora_layer_map = {}   # key → LoRALinear, used for saving
+        lora_layer_map = {}
 
         for idx in range(apply_from_block, len(dino_model.blocks)):
-            attn = dino_model.blocks[idx].attn
+            blk = dino_model.blocks[idx]
+            
+            if not isinstance(blk.attn.qkv, LoRALinear):
+                blk.attn.qkv  = LoRALinear(blk.attn.qkv,  rank=lora_rank, alpha=lora_rank * 2).to(self.device)
+                blk.attn.proj = LoRALinear(blk.attn.proj, rank=lora_rank, alpha=lora_rank * 2).to(self.device)
+            
+            if not isinstance(blk.mlp.fc1, LoRALinear):
+                blk.mlp.fc1 = LoRALinear(blk.mlp.fc1, rank=lora_rank, alpha=lora_rank * 2).to(self.device)
+                blk.mlp.fc2 = LoRALinear(blk.mlp.fc2, rank=lora_rank, alpha=lora_rank * 2).to(self.device)
 
-            wrapped_qkv  = LoRALinear(attn.qkv,  rank=lora_rank, alpha=lora_rank * 2).to(self.device)
-            wrapped_proj = LoRALinear(attn.proj, rank=lora_rank, alpha=lora_rank * 2).to(self.device)
+            lora_layer_map[f'block{idx}_qkv']   = blk.attn.qkv
+            lora_layer_map[f'block{idx}_proj']  = blk.attn.proj
+            lora_layer_map[f'block{idx}_fc1']   = blk.mlp.fc1
+            lora_layer_map[f'block{idx}_fc2']   = blk.mlp.fc2
 
-            attn.qkv  = wrapped_qkv
-            attn.proj = wrapped_proj
-
-            lora_layer_map[f'block{idx}_qkv']  = wrapped_qkv
-            lora_layer_map[f'block{idx}_proj'] = wrapped_proj
-
+        # Added heavy dropout for regularization
         proj_head = torch.nn.Sequential(
-            torch.nn.Linear(1024, 128),
+            torch.nn.Dropout(p=0.4),
+            torch.nn.Linear(5123, 128),
             torch.nn.ReLU(),
-            torch.nn.Linear(128, 64),
+            torch.nn.Dropout(p=0.3),
+            torch.nn.Linear(128, 1)
         ).to(self.device)
 
-        # ------------------------------------------------------------------ #
-        # 3. Pre-compute frozen activations (blocks 0..apply_from_block-1)    #
-        #    Identical hook trick — just the cutoff block index changes.       #
-        # ------------------------------------------------------------------ #
-        print(f"    [LoRA] Pre-computing frozen activations (blocks 0–{apply_from_block - 1})...")
-
-        frozen_cache = []
-        dino_model.eval()
-
-        captured = {}
-        def capture_input(module, inp, out):
-            captured['x'] = inp[0].detach()
-
-        hook = dino_model.blocks[apply_from_block].register_forward_hook(capture_input)
-
-        CACHE_BATCH = 32
-        with torch.no_grad():
-            with torch.autocast(device_type='cuda', dtype=torch.float16):
-                for i in range(0, len(tensors), CACHE_BATCH):
-                    batch = tensors[i:i + CACHE_BATCH].to(self.device)
-                    dino_model(batch)
-                    frozen_cache.append(captured['x'].float().cpu())
-                    del batch
-
-        hook.remove()
-        del captured
-        torch.cuda.empty_cache()
-
-        frozen_acts = torch.cat(frozen_cache, dim=0)   # (N, 197, 1024) on CPU
-        del frozen_cache
-        print(f"    [LoRA] Cached {frozen_acts.shape[0]} activations at block {apply_from_block}. "
-              f"Shape: {tuple(frozen_acts.shape)}")
-
-        # ------------------------------------------------------------------ #
-        # 4. Trainable params: LoRA A/B matrices + proj_head                  #
-        # ------------------------------------------------------------------ #
         trainable_params = list(proj_head.parameters())
         for layer in lora_layer_map.values():
             trainable_params += [layer.lora_A, layer.lora_B]
 
         n_trainable = sum(p.numel() for p in trainable_params)
-        print(f"    [LoRA] Trainable: {n_trainable / 1e6:.2f}M params "
-              f"(rank={lora_rank}, blocks {apply_from_block}–{len(dino_model.blocks) - 1})")
+        print(f"    [LoRA] Trainable: {n_trainable / 1e6:.2f}M params (rank={lora_rank}, blocks {apply_from_block}–{len(dino_model.blocks)-1})")
         print(f"--> [LoRA] Training {n_epochs} epochs...")
 
-        # ------------------------------------------------------------------ #
-        # 5. Training loop — identical to before except the forward pass      #
-        #    now runs blocks apply_from_block..23 (with LoRA) + proj_head.    #
-        # ------------------------------------------------------------------ #
-        optimizer = optim.AdamW(trainable_params, lr=2e-5, weight_decay=0.01)
+        # Reduced LR, increased weight decay
+        optimizer = optim.AdamW(trainable_params, lr=5e-5, weight_decay=0.05)
         scaler    = GradScaler()
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
 
-        def supcon_loss(features, labels, temperature=0.07):
-            device   = features.device
-            n        = features.shape[0]
-            sim      = torch.matmul(features, features.T) / temperature
-            self_mask = torch.eye(n, dtype=torch.bool, device=device)
-            sim.masked_fill_(self_mask, float('-inf'))
-            pos_mask = (labels.unsqueeze(0) == labels.unsqueeze(1)) & ~self_mask
-            if pos_mask.sum() == 0:
-                return torch.tensor(0.0, requires_grad=True, device=device)
-            log_prob = sim - torch.logsumexp(sim, dim=1, keepdim=True)
-            loss = -(log_prob.masked_fill(~pos_mask, 0.0)).sum(dim=1) / pos_mask.sum(dim=1).clamp(min=1)
-            return loss.mean()
+        criterion = torch.nn.BCEWithLogitsLoss()
 
         best_loss = float('inf')
 
         for epoch in tqdm(range(n_epochs)):
-            # Set LoRA layers + proj_head to train mode; frozen blocks stay eval
             for layer in lora_layer_map.values():
                 layer.train()
             proj_head.train()
 
-            perm         = torch.randperm(len(frozen_acts))
-            epoch_acts   = frozen_acts[perm]
-            epoch_labels = labels[perm]
-
             epoch_loss = 0.0
             n_batches  = 0
             optimizer.zero_grad()
+            
+            random.shuffle(verified_data)
 
-            for i in range(0, len(epoch_acts), batch_size):
-                batch_acts   = epoch_acts[i:i + batch_size].to(self.device)
-                batch_labels = epoch_labels[i:i + batch_size].to(self.device)
+            for i, item in enumerate(verified_data):
+                if len(item['pos']) == 0 and len(item['neg']) == 0: continue
+                
+                # Load full image
+                image_source, _ = ImageProcessor.load_image(item['path'], self.STANDARD_IMAGE_SCALE)
+
+                pil_img = Image.fromarray(image_source)
+                if random.random() > 0.4:
+                    pil_img = TF.adjust_brightness(pil_img, brightness_factor=random.uniform(0.7, 1.3))
+                    pil_img = TF.adjust_contrast(pil_img, contrast_factor=random.uniform(0.7, 1.3))
+                if random.random() > 0.6:
+                    pil_img = TF.gaussian_blur(pil_img, kernel_size=[3, 5][random.randint(0,1)])
+                
+                image_source = np.array(pil_img)
+                
+                # Gather boxes
+                pos_boxes = item['pos'] if isinstance(item['pos'], torch.Tensor) else torch.tensor(item['pos'])
+                neg_boxes = item['neg'] if isinstance(item['neg'], torch.Tensor) else torch.tensor(item['neg'])
+                
+                # Subsample negatives
+                n_neg_sample = min(len(neg_boxes), max(10, len(pos_boxes) * 3))
+                if n_neg_sample > 0: neg_boxes = neg_boxes[:n_neg_sample]
+                
+                arrays, labels = [], []
+                if len(pos_boxes) > 0:
+                    arrays.append(pos_boxes)
+                    labels.append(torch.full((len(pos_boxes),), 0.9)) # Label Smoothing
+                if len(neg_boxes) > 0:
+                    arrays.append(neg_boxes)
+                    labels.append(torch.full((len(neg_boxes),), 0.1)) # Label Smoothing
+                    
+                if not arrays: continue
+                
+                all_boxes = torch.cat(arrays)
+                batch_labels = torch.cat(labels).to(self.device).float()
 
                 with torch.autocast(device_type='cuda', dtype=torch.float16):
-                    # Run only the LoRA-adapted blocks — blocks 0..apply_from_block-1
-                    # were already baked into batch_acts by the cache step above.
-                    x = batch_acts
-                    for blk_idx in range(apply_from_block, len(dino_model.blocks)):
-                        x = dino_model.blocks[blk_idx](x)
-
-                    cls  = x[:, 0, :]              # CLS token  (B, 1024)
-                    proj = proj_head(cls)          # (B, 64)
-                    proj = F.normalize(proj, dim=1)
-                    loss = supcon_loss(proj, batch_labels) / grad_accum_steps
+                    features = self.extract_roi_patch_features(image_source, all_boxes, is_training=True)
+                    if len(features) == 0: continue
+                    
+                    features = features.to(self.device)
+                    
+                    proj = proj_head(features).squeeze(-1) 
+                    loss = criterion(proj, batch_labels) / grad_accum_steps
 
                 scaler.scale(loss).backward()
 
-                if (i // batch_size + 1) % grad_accum_steps == 0 or \
-                   (i + batch_size) >= len(epoch_acts):
+                if (i + 1) % grad_accum_steps == 0 or (i + 1) == len(verified_data):
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
                     scaler.step(optimizer)
@@ -643,20 +579,15 @@ class AnnotateEngine:
 
                 epoch_loss += loss.item() * grad_accum_steps
                 n_batches  += 1
-                del batch_acts, batch_labels, x, cls, proj, loss
 
             scheduler.step()
             avg_loss = epoch_loss / max(n_batches, 1)
 
-            if (epoch + 1) % 10 == 0:
-                print(f"    Epoch {epoch + 1:3d}/{n_epochs} | "
-                      f"Loss: {avg_loss:.4f} | "
-                      f"LR: {scheduler.get_last_lr()[0]:.2e}")
+            if (epoch + 1) % 5 == 0:
+                print(f"    Epoch {epoch + 1:3d}/{n_epochs} | Loss: {avg_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.2e}")
 
             if avg_loss < best_loss:
                 best_loss = avg_loss
-
-                # Save only the LoRA deltas + proj_head — not the full model
                 lora_state = {
                     name: {'A': layer.lora_A.data.cpu(), 'B': layer.lora_B.data.cpu()}
                     for name, layer in lora_layer_map.items()
@@ -673,11 +604,10 @@ class AnnotateEngine:
 
         print(f"\n--> [LoRA] Done. Best loss: {best_loss:.4f} | Saved: {save_path}")
 
-        # Freeze everything again — LoRA weights stay injected in the live model
+        # Freeze everything again
         for param in dino_model.parameters():
             param.requires_grad = False
 
-        del frozen_acts
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -698,23 +628,29 @@ class AnnotateEngine:
             apply_from_block = checkpoint['apply_from_block']
             lora_state       = checkpoint['lora_state']
 
-            # Freeze base weights, then inject LoRALinear wrappers and load saved A/B
             for param in dino_model.parameters():
                 param.requires_grad = False
 
             for name, ab in lora_state.items():
-                # name format: 'block{idx}_qkv' or 'block{idx}_proj'
-                parts    = name.split('_')         # ['block12', 'qkv']
+                parts = name.split('_')
                 blk_idx  = int(parts[0].replace('block', ''))
-                layer_id = parts[1]                # 'qkv' or 'proj'
+                layer_id = parts[1]
 
-                attn     = dino_model.blocks[blk_idx].attn
-                original = getattr(attn, layer_id)  # the raw nn.Linear
+                blk = dino_model.blocks[blk_idx]
+                
+                # ROUTE TO CORRECT MODULE
+                if layer_id in ['qkv', 'proj']:
+                    target_module = blk.attn
+                elif layer_id in ['fc1', 'fc2']:
+                    target_module = blk.mlp
+                else:
+                    continue
 
-                # Only wrap if not already wrapped (idempotent on repeated loads)
+                original = getattr(target_module, layer_id)  # the raw nn.Linear
+
                 if not isinstance(original, LoRALinear):
                     wrapped = LoRALinear(original, rank=lora_rank, alpha=lora_rank * 2)
-                    setattr(attn, layer_id, wrapped)
+                    setattr(target_module, layer_id, wrapped)
                 else:
                     wrapped = original
 
@@ -997,32 +933,13 @@ class AnnotateEngine:
         visual_feats = F.normalize(visual_feats, dim=1, p=2)
 
         return visual_feats
-    def extract_roi_patch_features(self, image_source, boxes, force_cpu=False):
-        """
-        Runs ONE DINOv2 forward pass on the full image, then does ROI pooling per box.
-        Produces object, context, and contrast features with no context scale parameter.
-        
-        Multi-layer:
-          - blocks[5]  → early (texture, low-level patterns)
-          - blocks[11] → mid   (structural)
-          - final      → late  (semantic)
-        
-        Per-box output:
-          obj_early  (1024) — what the object looks like texturally
-          obj_late   (1024) — what the object is semantically
-          ctx_late   (1024) — what surrounds it
-          contrast   (1024) — obj_late - ctx_late  (the key discriminator)
-          mid_global (1024) — full-scene structural context
-        
-        Total: (N, 5120). No crop, no scale factor, no magic number.
-        Cached: repeated calls with the same image_source hit the cache.
-        """
+
+    def extract_roi_patch_features(self, image_source, boxes, is_training=False, force_cpu=False):
         if len(boxes) == 0:
             return torch.empty(0)
 
         boxes_np = boxes.cpu().numpy() if isinstance(boxes, torch.Tensor) else np.array(boxes)
 
-        # --- Device setup (mirrors existing extract_dino_features pattern) ---
         if force_cpu:
             dino_model = self.model_manager.models['dino']
             dino_model.to(self.cpu)
@@ -1033,31 +950,56 @@ class AnnotateEngine:
             dino_model = self.model_manager.models['dino']
             device = self.device
 
-        # --- Single forward pass, cached by image identity ---
         img_id = hash(image_source.tobytes())
         cache_valid = (
             self._dino_cache.get('img_id') == img_id and
-            self._dino_cache.get('device') == device
+            self._dino_cache.get('device') == device and
+            not is_training
         )
 
         if not cache_valid:
             pil_img = Image.fromarray(image_source)
             img_tensor = self.dino_transform(pil_img).unsqueeze(0).to(device)
-            # dino_transform resizes to (336, 336) → patch grid is 336/14 = 24x24
 
             intermediate = {}
+            attn_store = {}
+            n_reg = getattr(dino_model, 'num_register_tokens', 0)
 
             def make_hook(key):
                 def hook(module, inp, out):
-                    # out: (B, num_patches+1, dim) — index 0 is CLS, rest are patches
-                    intermediate[key] = out[:, 1:, :].detach()
+                    val_patches = out[:, 1 + n_reg:, :]
+                    if not is_training: val_patches = val_patches.detach()
+                    intermediate[key + '_patches'] = val_patches
+                    
+                    if n_reg > 0:
+                        val_regs = out[:, 1:1 + n_reg, :]
+                        if not is_training: val_regs = val_regs.detach()
+                        intermediate[key + '_regs'] = val_regs
                 return hook
+ 
+            def capture_attn_from_qkv(module, inp, out):
+                B, N, C = inp[0].shape 
+                num_heads = dino_model.blocks[-1].attn.num_heads
+                head_dim = C // num_heads
+                
+                qkv = out.reshape(B, N, 3, num_heads, head_dim).permute(2, 0, 3, 1, 4)
+                
+                q = qkv[0].float()  
+                k = qkv[1].float()  
+                
+                scale = head_dim ** -0.5
+                attn = (q * scale) @ k.transpose(-2, -1) 
+                attn = attn.softmax(dim=-1)
+                
+                attn_store['weights'] = attn if is_training else attn.detach()
 
             h_early = dino_model.blocks[5].register_forward_hook(make_hook('early'))
             h_mid   = dino_model.blocks[11].register_forward_hook(make_hook('mid'))
+            h_attn  = dino_model.blocks[-1].attn.qkv.register_forward_hook(capture_attn_from_qkv)
 
+            context = torch.enable_grad() if is_training else torch.no_grad()
             try:
-                with torch.no_grad():
+                with context:
                     if device == self.device:
                         with torch.autocast(device_type=self.device, dtype=torch.float16):
                             out = dino_model.forward_features(img_tensor)
@@ -1066,73 +1008,111 @@ class AnnotateEngine:
             finally:
                 h_early.remove()
                 h_mid.remove()
-            GRID = 336 // 14   # = 24
-            DIM  = 1024        # ViT-L hidden dim
+                h_attn.remove()
 
-            # Move everything to CPU immediately to free VRAM
+            GRID = 336 // 14   # = 24
+            DIM  = 1024
+
+            # --- CRITICAL FIX: Removed .cpu() to keep the graph alive during training ---
+            raw_attn = attn_store['weights'].float()
+            cls_to_patch = raw_attn[0, :, 0, 1 + n_reg:]
+            attn_map = cls_to_patch.mean(0).reshape(GRID, GRID)
+            
+            if 'x_norm_regtokens' in out and n_reg > 0:
+                reg_tokens = out['x_norm_regtokens'].float()[0]  
+                reg_global = F.normalize(reg_tokens.mean(0, keepdim=True), dim=1).squeeze(0)
+            else:
+                reg_global = F.normalize(out['x_norm_clstoken'].float()[0:1], dim=1).squeeze(0)
+
+            early_feat = intermediate['early_patches'].float()[0].reshape(GRID, GRID, DIM)
+            mid_feat   = intermediate['mid_patches'].float()[0].reshape(GRID, GRID, DIM)
+            late_feat  = out['x_norm_patchtokens'].float()[0].reshape(GRID, GRID, DIM)
+
+            # Safely move to CPU only if we are doing inference/caching
+            if not is_training:
+                attn_map   = attn_map.cpu()
+                reg_global = reg_global.cpu()
+                early_feat = early_feat.cpu()
+                mid_feat   = mid_feat.cpu()
+                late_feat  = late_feat.cpu()
+
             self._dino_cache = {
-                'img_id': img_id,
-                'device': device,
-                'early': intermediate['early'].float().cpu()[0].reshape(GRID, GRID, DIM),  # (24,24,1024)
-                'mid':   intermediate['mid'].float().cpu()[0].reshape(GRID, GRID, DIM),
-                'late':  out['x_norm_patchtokens'].float().cpu()[0].reshape(GRID, GRID, DIM),
-                'grid':  GRID,
-                'dim':   DIM,
+                'img_id':     img_id,
+                'device':     device,
+                'early':      early_feat,
+                'mid':        mid_feat,
+                'late':       late_feat,
+                'attn':       attn_map,
+                'reg_global': reg_global,
+                'grid':       GRID,
+                'dim':        DIM,
             }
 
-            del img_tensor, intermediate, out
+            del img_tensor, intermediate, out, attn_store, raw_attn
 
-        grid = self._dino_cache['grid']
-        dim  = self._dino_cache['dim']
-        feat_early = self._dino_cache['early']   # (24, 24, 1024) on CPU
-        feat_mid   = self._dino_cache['mid']
+        grid       = self._dino_cache['grid']
+        dim        = self._dino_cache['dim']
+        feat_early = self._dino_cache['early']
         feat_late  = self._dino_cache['late']
+        attn_map   = self._dino_cache['attn']
+        reg_global = self._dino_cache['reg_global']
 
-        # Precompute mid global once (same for all boxes in this image)
-        mid_global = F.normalize(feat_mid.reshape(-1, dim).mean(0, keepdim=True), dim=1).squeeze(0)
+        attn_total = attn_map.sum() + 1e-6
 
-        # --- Per-box ROI pooling ---
+        def n(t): return F.normalize(t.unsqueeze(0), dim=1, p=2).squeeze(0)
+
         all_features = []
 
         for box in boxes_np:
             cx, cy, bw, bh = box
 
-            # Map normalized cxcywh → patch grid integer bounds
             x1 = max(0,    int((cx - bw / 2) * grid))
             y1 = max(0,    int((cy - bh / 2) * grid))
             x2 = min(grid, int((cx + bw / 2) * grid) + 1)
             y2 = min(grid, int((cy + bh / 2) * grid) + 1)
-
-            # Guarantee at least one patch
             x2 = max(x2, x1 + 1)
             y2 = max(y2, y1 + 1)
 
-            # Inner ROI (object patches)
             obj_early = feat_early[y1:y2, x1:x2].reshape(-1, dim).mean(0)
-            obj_late  = feat_late[y1:y2, x1:x2].reshape(-1, dim).mean(0)
 
-            # Outer ROI (all patches outside the box = true context, no scale param)
-            inner_mask             = torch.zeros(grid, grid, dtype=torch.bool)
+            roi_attn = attn_map[y1:y2, x1:x2].reshape(-1)
+            roi_attn_weights = roi_attn / (roi_attn.sum() + 1e-6)
+            roi_patches_late = feat_late[y1:y2, x1:x2].reshape(-1, dim)
+            obj_late = (roi_patches_late * roi_attn_weights.unsqueeze(1)).sum(0)
+
+            inner_mask = torch.zeros(grid, grid, dtype=torch.bool, device=feat_late.device)
             inner_mask[y1:y2, x1:x2] = True
             ctx_late = feat_late[~inner_mask].mean(0)
 
-            # Contrast: what makes this box different from its surroundings
-            contrast = obj_late - ctx_late
+            contrast     = obj_late - ctx_late
+            contrast_mag = torch.norm(contrast)
+            contrast_dir = contrast / (contrast_mag + 1e-6)
+            contrast_mag_feat = torch.clamp(contrast_mag / 10.0, min=0.0, max=1.0).unsqueeze(0)
 
-            # Normalize each component independently before concatenating
-            def n(t): return F.normalize(t.unsqueeze(0), dim=1, p=2).squeeze(0)
+            roi_attn_mass = (attn_map[y1:y2, x1:x2].sum() / attn_total)
+            roi_area_frac = torch.tensor(((y2 - y1) * (x2 - x1)) / (grid * grid), device=roi_attn_mass.device)
+            attn_density  = roi_attn_mass / (roi_area_frac + 1e-6)
+            attn_feats = torch.stack([
+                roi_attn_mass,
+                torch.clamp(attn_density / 5.0, max=1.0)
+            ])
+
+            # if is_training:
+            #     all_features.append(n(obj_late)) # Just the 1024-dim semantic feature
+            #     continue
 
             feat = torch.cat([
-                n(obj_early),   # (1024) — texture signal
-                n(obj_late),    # (1024) — semantic object identity
-                n(ctx_late),    # (1024) — semantic surroundings
-                n(contrast),    # (1024) — object vs background gap
-                mid_global,     # (1024) — already normalized above
-            ])   # → (5120,)
-
+                n(obj_early),       
+                n(obj_late),        
+                n(ctx_late),        
+                contrast_dir,       
+                contrast_mag_feat,  
+                reg_global,         
+                attn_feats,         
+            ])
             all_features.append(feat)
 
-        return torch.stack(all_features).float()   # (N, 5120)
+        return torch.stack(all_features).float()
 
     def _extract_geometric_features(self, boxes, img_shape):
         """
@@ -1211,21 +1191,10 @@ class AnnotateEngine:
     def _extract_features(self, image_source, boxes, obj_crops, ctx_crops, force_cpu=False):
         """
         Extract rich feature set combining visual + geometric + texture.
-        
-        Args:
-            image_source: The original image (numpy array)
-            boxes: Normalized boxes (N, 4) in cxcywh format
-            obj_crops: List of PIL Image crops (object-focused)
-            ctx_crops: List of PIL Image crops (context-focused)
-            force_cpu: Whether to force CPU for feature extraction
-
         !! NOTE:
             Visual features now come from ROI patch pooling (single DINOv2 pass).
             obj_crops kept for texture only. ctx_crops no longer used.
-            Signature unchanged — all callers work without modification.
-        
-        Returns:
-            Combined feature tensor (N, feature_dim)
+            Signature unchanged - all callers work without modification.
         """
         roi_feats = self.extract_roi_patch_features(image_source, boxes, force_cpu=force_cpu) # (N, 5120)
         geom      = self._extract_geometric_features(boxes, image_source.shape).float() # (N, 10)
@@ -1245,14 +1214,6 @@ class AnnotateEngine:
     #     return feat_dino
 
     def _get_dual_crops(self, image_source, boxes, min_crop_size=64):
-        """
-        Adaptive dual-crop strategy using calibrated size thresholds.
-        Context size is determined by the object's size category.
-        
-        Strategy:
-        - Object crop: Tight bounding box with small padding
-        - Context crop: Size based on calibrated thresholds (no magic numbers)
-        """
         if len(boxes) == 0: return [], []
         
         img_h, img_w, _ = image_source.shape
@@ -1338,7 +1299,6 @@ class AnnotateEngine:
         return obj_crops, ctx_crops_pil
     
     def _save_verifier(self, model, file_path="weights/verifier.pkl"):
-        """Saves the trained SVM model to disk."""
         if file_path is None: return
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
         if 'size_thresholds' not in model:
@@ -1449,10 +1409,6 @@ class AnnotateEngine:
         return total_processed
 
     def train_verifier(self, verified_data, save_path="weights/verifier.pkl", fast_train=False):
-        """
-        Phase 2 of Calibration: Extracts CONTEXT-AWARE features, trains SVM.
-        Refactored to enforce CPU-heavy preprocessing and strict VRAM cleanup.
-        """
         print(f"\n--> [Training] Processing {len(verified_data)} verified images...")
         self.model_manager.switch_to('dino')
         augmentor = Augmentor()
@@ -1493,7 +1449,7 @@ class AnnotateEngine:
             gc.collect()
 
         if total_pos == 0 or total_neg == 0:
-            print(f"[Error] Training failed. Insufficient data.")
+            print("[Error] Training failed. Insufficient data.")
             return None, None, None, None
 
         print(f"--> [Training] Fitting SVM on {total_pos} Positives vs {total_neg} Negatives...")
