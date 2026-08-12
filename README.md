@@ -1,10 +1,13 @@
 # Annotate
 
 An automated annotation pipeline for object detection datasets using natural language descriptions and human-in-the-loop learning.
-<img width="500" height="500" alt="test-5" src="https://github.com/user-attachments/assets/ce46f64b-423a-4932-bc0a-d589c1c1fae8" />
-<img width="500" height="500" alt="test-5_calibrated" src="https://github.com/user-attachments/assets/44e4c927-d2dd-416e-be71-1451d386b0bb" />
-<img width="500" height="500" alt="test-2" src="https://github.com/user-attachments/assets/40aee39d-f632-4258-a9f6-ae0910859c80" />
-<img width="500" height="500" alt="S5_noBox" src="https://github.com/user-attachments/assets/1709dfcf-d714-4de9-b6f5-3f55edb9f9af" />
+
+
+<img width="250" height="250" alt="test-5" src="https://github.com/user-attachments/assets/ce46f64b-423a-4932-bc0a-d589c1c1fae8" />
+<img width="250" height="250" alt="test-5_calibrated" src="https://github.com/user-attachments/assets/44e4c927-d2dd-416e-be71-1451d386b0bb" />
+<br/>
+<img width="250" height="250" alt="test-2" src="https://github.com/user-attachments/assets/40aee39d-f632-4258-a9f6-ae0910859c80" />
+<img width="250" height="250" alt="S5_noBox" src="https://github.com/user-attachments/assets/1709dfcf-d714-4de9-b6f5-3f55edb9f9af" />
 
 
 ## Vision
@@ -30,17 +33,23 @@ We've tested the system on pothole detection and seen promising results. Here ar
 **Segmentation Results**
 
 The model successfully identifies potholes across different scenarios:
+
+
 <img width="250" height="250" alt="test-7_calibrated" src="https://github.com/user-attachments/assets/bdc0dd88-2cbe-432a-b480-6440cf412e53" />
 <img width="250" height="250" alt="best_calibrated_result2" src="https://github.com/user-attachments/assets/028f56a1-da63-4e98-adb4-346c34ea0894" />
 
 **Detection with Confidence Scores**
 
 When we added confidence scoring and bounding boxes, the model showed strong performance across diverse conditions:
+
+
 <img width="1400" height="1400" alt="S5" src="https://github.com/user-attachments/assets/ffb93535-943d-4c24-8267-7282f8007cf4" />
 
 **High-Confidence Predictions**
 
 With proper calibration, we're seeing confidence scores consistently in the 0.75-0.99 range on well-lit, standard scenarios:
+
+
 <img width="1400" height="1400" alt="poc_result" src="https://github.com/user-attachments/assets/5f29b045-213a-41c9-b0c0-88a93b2530ff" />
 
 ### The Problem
@@ -78,11 +87,3 @@ To make this actually useful, we need to tackle the generalization problem head-
 ## Getting Started
 
 Documentation and setup instructions coming as the project matures.
-
-## Contributing
-
-We're actively working on this and would welcome feedback on what works, what doesn't, and what you'd want to build with a tool like this.
-
-## License
-
-TBD
