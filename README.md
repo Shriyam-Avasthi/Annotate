@@ -30,8 +30,8 @@ We've tested the system on pothole detection and seen promising results. Here ar
 **Segmentation Results**
 
 The model successfully identifies potholes across different scenarios:
-<img width="500" height="500" alt="test-7_calibrated" src="https://github.com/user-attachments/assets/bdc0dd88-2cbe-432a-b480-6440cf412e53" />
-<img width="500" height="500" alt="best_calibrated_result2" src="https://github.com/user-attachments/assets/028f56a1-da63-4e98-adb4-346c34ea0894" />
+<img width="250" height="250" alt="test-7_calibrated" src="https://github.com/user-attachments/assets/bdc0dd88-2cbe-432a-b480-6440cf412e53" />
+<img width="250" height="250" alt="best_calibrated_result2" src="https://github.com/user-attachments/assets/028f56a1-da63-4e98-adb4-346c34ea0894" />
 
 **Detection with Confidence Scores**
 
